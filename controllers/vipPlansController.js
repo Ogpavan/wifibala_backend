@@ -76,7 +76,7 @@ export const createVipPlan = async (req, res) => {
         speed_mbps || null,
         data_policy,
         validity_days,
-        JSON.stringify(safeParse(additional_benefits)),
+        safeParse(additional_benefits),
         price || 0,
       ]
     );
@@ -85,11 +85,12 @@ export const createVipPlan = async (req, res) => {
     const planId = plan.id;
 
     // Insert OTT platforms into plan_ott_platforms
-    const ottIds = safeParse(ott_platforms).map(Number).filter(Boolean);
+    const ottIds = [...new Set(safeParse(ott_platforms).map(Number).filter(Boolean))];
     if (ottIds.length) {
       const insertOttQuery = `
         INSERT INTO plan_ott_platforms (plan_id, ott_id)
         VALUES ${ottIds.map((_, i) => `($1, $${i + 2})`).join(", ")}
+        ON CONFLICT (plan_id, ott_id) DO NOTHING
       `;
       await pool.query(insertOttQuery, [planId, ...ottIds]);
     }
@@ -173,23 +174,24 @@ export const updateVipPlan = async (req, res) => {
         speed_mbps,
         data_policy,
         validity_days,
-        JSON.stringify(safeParse(additional_benefits)),
+        safeParse(additional_benefits),
         price,
         id,
       ]
     );
 
     // Update OTT platforms
-    if (Array.isArray(ott_platforms)) {
+    if (ott_platforms !== undefined) {
       // Delete old OTT links
       await pool.query("DELETE FROM plan_ott_platforms WHERE plan_id = $1", [id]);
 
       // Insert new OTT links
-      const ottIds = safeParse(ott_platforms).map(Number).filter(Boolean);
+      const ottIds = [...new Set(safeParse(ott_platforms).map(Number).filter(Boolean))];
       if (ottIds.length) {
         const insertOttQuery = `
           INSERT INTO plan_ott_platforms (plan_id, ott_id)
           VALUES ${ottIds.map((_, i) => `($1, $${i + 2})`).join(", ")}
+          ON CONFLICT (plan_id, ott_id) DO NOTHING
         `;
         await pool.query(insertOttQuery, [id, ...ottIds]);
       }

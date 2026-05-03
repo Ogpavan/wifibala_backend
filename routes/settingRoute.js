@@ -1,4 +1,5 @@
 import express from "express";
+import upload from "../middlewares/upload.js";
 import {
   getAllSettings,
   getSettingsById,
@@ -11,8 +12,8 @@ const router = express.Router();
 
 router.get("/", getAllSettings);
 router.get("/:id", getSettingsById);
-router.post("/", createSettings);
-router.put("/:id", updateSettings);
+router.post("/", upload.single("logo"), createSettings);
+router.put("/:id", upload.single("logo"), updateSettings);
 router.delete("/:id", deleteSettings);
 
 export default router;

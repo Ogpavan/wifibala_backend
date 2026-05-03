@@ -43,8 +43,9 @@ const createPlan = async (req, res) => {
     const plan_id = planResult.rows[0].plan_id;
 
     // 2️⃣ Insert OTT mappings
-    if (ott_platforms.length > 0) {
-      const values = ott_platforms
+    const uniqueOttPlatforms = [...new Set(ott_platforms.map(Number).filter(Boolean))];
+    if (uniqueOttPlatforms.length > 0) {
+      const values = uniqueOttPlatforms
         .map((_, index) => `($1, $${index + 2})`)
         .join(",");
 
@@ -52,8 +53,9 @@ const createPlan = async (req, res) => {
         `
         INSERT INTO plan_ott_platforms (plan_id, ott_id)
         VALUES ${values}
+        ON CONFLICT (plan_id, ott_id) DO NOTHING
         `,
-        [plan_id, ...ott_platforms],
+        [plan_id, ...uniqueOttPlatforms],
       );
     }
 

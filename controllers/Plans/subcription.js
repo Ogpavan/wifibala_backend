@@ -25,15 +25,33 @@ import pool from "../../config/db.js";
 // Get all subscribed user details
 export const getAllSubscriptions = async (req, res) => {
   try {
-    // Pagination and search
-    const { page = 1, limit = 20, search = "" } = req.query;
+    // Pagination and filters
+    const { page = 1, limit = 20, search = "", operator_id = "", status = "all" } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
-    let searchClause = "";
-    let values = [parseInt(limit), offset];
+
+    let whereClause = "";
+    const whereValues = [];
+
     if (search && search.trim() !== "") {
-      searchClause = `AND (LOWER(u.name) LIKE $3 OR u.phone_number LIKE $3)`;
-      values = [parseInt(limit), offset, `%${search.toLowerCase()}%`];
+      whereValues.push(`%${search.toLowerCase()}%`);
+      whereClause += ` AND (LOWER(u.name) LIKE $${whereValues.length} OR u.phone_number LIKE $${whereValues.length})`;
     }
+
+    if (operator_id) {
+      whereValues.push(parseInt(operator_id));
+      whereClause += ` AND p.operator_id = $${whereValues.length}`;
+    }
+
+    if (status === "active") {
+      whereClause += ` AND us.end_date >= CURRENT_DATE`;
+    } else if (status === "expired") {
+      whereClause += ` AND us.end_date < CURRENT_DATE`;
+    }
+
+    const values = [...whereValues, parseInt(limit), offset];
+    const limitParam = `$${whereValues.length + 1}`;
+    const offsetParam = `$${whereValues.length + 2}`;
+
     const query = `
       SELECT us.*, u.name AS user_name, u.email, u.phone_number,
         p.plan_id, p.operator_id, p.description AS plan_description, p.price AS plan_price, p.validity, p.speed, p.data_limit, p.is_active,
@@ -43,19 +61,20 @@ export const getAllSubscriptions = async (req, res) => {
       JOIN plans p ON us.plan_id = p.plan_id
       LEFT JOIN operators o ON p.operator_id = o.id
       WHERE 1=1
-      ${searchClause}
+      ${whereClause}
       ORDER BY us.created_at DESC
-      LIMIT $1 OFFSET $2;
+      LIMIT ${limitParam} OFFSET ${offsetParam};
     `;
     const countQuery = `
       SELECT COUNT(*) AS total
       FROM user_subscriptions us
       JOIN users u ON us.user_id = u.user_id
+      JOIN plans p ON us.plan_id = p.plan_id
       WHERE 1=1
-      ${searchClause}
+      ${whereClause}
     `;
     const { rows } = await pool.query(query, values);
-    const countRes = await pool.query(countQuery, values.slice(2));
+    const countRes = await pool.query(countQuery, whereValues);
     const total = parseInt(countRes.rows[0]?.total || 0);
     return res.status(200).json({
       message: "All subscriptions fetched successfully",

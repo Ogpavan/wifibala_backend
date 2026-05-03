@@ -19,12 +19,15 @@ export default async (req, res) => {
         o.created_at,
         o.updated_at,
         p.description AS plan_description,
+        p.operator_id,
+        op.name AS operator_name,
         p.price,
         p.validity,
         p.speed,
         p.data_limit
       FROM offers o 
       LEFT JOIN plans p ON o.plan_id = p.plan_id 
+      LEFT JOIN operators op ON p.operator_id = op.id
       WHERE 1=1
     `;
     const values = [];

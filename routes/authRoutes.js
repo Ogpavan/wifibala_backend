@@ -1,6 +1,8 @@
 import express from "express";
 import {
   signup,
+  createUserByAdmin,
+  updateUserByAdmin,
   signin,
   getAllUsers,
   deleteUser,
@@ -12,7 +14,9 @@ const router = express.Router();
 
 router.post("/signup", signup);
 router.post("/signin", signin);
+router.post("/admin/users", createUserByAdmin);
 router.get("/admin/users", getAllUsers);
+router.put("/admin/users/:id", updateUserByAdmin);
 
 // Soft delete user
 router.delete("/admin/users/:id", deleteUser);
