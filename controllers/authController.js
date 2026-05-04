@@ -10,7 +10,12 @@ export const deleteUser = async (req, res) => {
 
   try {
     const result = await pool.query(
-      "UPDATE users SET isdeleted = true, updated_at = NOW() WHERE user_id = $1",
+      `UPDATE users
+       SET isdeleted = true,
+           phone_number = CONCAT('deleted_', user_id, '_', EXTRACT(EPOCH FROM NOW())::bigint),
+           email = CONCAT('deleted_', user_id, '_', EXTRACT(EPOCH FROM NOW())::bigint, '@deleted.local'),
+           updated_at = NOW()
+       WHERE user_id = $1`,
       [id],
     );
 
@@ -48,12 +53,19 @@ export const signup = async (req, res) => {
   }
 
   try {
-    const existing = await pool.query(
-      "SELECT user_id FROM users WHERE phone_number = $1 OR email = $2",
-      [mobile, email],
+    const normalizedMobile = mobile.trim();
+    const normalizedEmail = email.trim();
+
+    const activeExisting = await pool.query(
+      `SELECT user_id
+       FROM users
+       WHERE isdeleted = false
+         AND (phone_number = $1 OR email = $2)
+       LIMIT 1`,
+      [normalizedMobile, normalizedEmail],
     );
 
-    if (existing.rows.length > 0) {
+    if (activeExisting.rows.length > 0) {
       return res.status(409).json({
         success: false,
         message: "User already exists",
@@ -62,11 +74,48 @@ export const signup = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    const deletedMatch = await pool.query(
+      `SELECT user_id
+       FROM users
+       WHERE isdeleted = true
+         AND (phone_number = $1 OR email = $2)
+       ORDER BY updated_at DESC NULLS LAST, created_at DESC
+       LIMIT 1`,
+      [normalizedMobile, normalizedEmail],
+    );
+
+    if (deletedMatch.rows.length > 0) {
+      await pool.query(
+        `UPDATE users
+         SET name = $1,
+             phone_number = $2,
+             email = $3,
+             password_hash = $4,
+             address = $5,
+             isdeleted = false,
+             updated_at = NOW()
+         WHERE user_id = $6`,
+        [
+          name,
+          normalizedMobile,
+          normalizedEmail,
+          hashedPassword,
+          address,
+          deletedMatch.rows[0].user_id,
+        ],
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: "Signup successful",
+      });
+    }
+
     await pool.query(
       `INSERT INTO users 
        (name, phone_number, email, password_hash, address, wallet, created_at, updated_at, isdeleted)
        VALUES ($1, $2, $3, $4, $5, 0, NOW(), NOW(), false)`,
-      [name, mobile, email, hashedPassword, address],
+      [name, normalizedMobile, normalizedEmail, hashedPassword, address],
     );
 
     res.status(201).json({
@@ -96,17 +145,28 @@ export const createUserByAdmin = async (req, res) => {
   }
 
   try {
+    const normalizedMobile = mobile.trim();
     const normalizedEmail = email?.trim() ? email.trim() : null;
-    const existing = normalizedEmail
-      ? await pool.query(
-          "SELECT user_id FROM users WHERE phone_number = $1 OR email = $2",
-          [mobile, normalizedEmail],
-        )
-      : await pool.query("SELECT user_id FROM users WHERE phone_number = $1", [
-          mobile,
-        ]);
 
-    if (existing.rows.length > 0) {
+    const activeExisting = normalizedEmail
+      ? await pool.query(
+          `SELECT user_id
+           FROM users
+           WHERE isdeleted = false
+             AND (phone_number = $1 OR email = $2)
+           LIMIT 1`,
+          [normalizedMobile, normalizedEmail],
+        )
+      : await pool.query(
+          `SELECT user_id
+           FROM users
+           WHERE isdeleted = false
+             AND phone_number = $1
+           LIMIT 1`,
+          [normalizedMobile],
+        );
+
+    if (activeExisting.rows.length > 0) {
       return res.status(409).json({
         success: false,
         message: "User already exists",
@@ -115,12 +175,61 @@ export const createUserByAdmin = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    const deletedMatch = normalizedEmail
+      ? await pool.query(
+          `SELECT user_id
+           FROM users
+           WHERE isdeleted = true
+             AND (phone_number = $1 OR email = $2)
+           ORDER BY updated_at DESC NULLS LAST, created_at DESC
+           LIMIT 1`,
+          [normalizedMobile, normalizedEmail],
+        )
+      : await pool.query(
+          `SELECT user_id
+           FROM users
+           WHERE isdeleted = true
+             AND phone_number = $1
+           ORDER BY updated_at DESC NULLS LAST, created_at DESC
+           LIMIT 1`,
+          [normalizedMobile],
+        );
+
+    if (deletedMatch.rows.length > 0) {
+      const result = await pool.query(
+        `UPDATE users
+         SET name = $1,
+             phone_number = $2,
+             email = $3,
+             password_hash = $4,
+             address = $5,
+             isdeleted = false,
+             updated_at = NOW()
+         WHERE user_id = $6
+         RETURNING user_id, name, phone_number, email, address, COALESCE(wallet, 0) AS wallet, created_at`,
+        [
+          name,
+          normalizedMobile,
+          normalizedEmail,
+          hashedPassword,
+          address,
+          deletedMatch.rows[0].user_id,
+        ],
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: "User created successfully",
+        user: result.rows[0],
+      });
+    }
+
     const created = await pool.query(
       `INSERT INTO users
        (name, phone_number, email, password_hash, address, wallet, created_at, updated_at, isdeleted)
        VALUES ($1, $2, $3, $4, $5, 0, NOW(), NOW(), false)
        RETURNING user_id, name, phone_number, email, address, COALESCE(wallet, 0) AS wallet, created_at`,
-      [name, mobile, normalizedEmail, hashedPassword, address],
+      [name, normalizedMobile, normalizedEmail, hashedPassword, address],
     );
 
     return res.status(201).json({

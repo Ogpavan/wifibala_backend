@@ -27,7 +27,8 @@ export const getPlanById = async (req, res) => {
           JSON_AGG(
             DISTINCT JSONB_BUILD_OBJECT(
               'ott_id', o.ott_id,
-              'ott_name', o.ott_name
+              'ott_name', o.ott_name,
+              'logo_url', o.logo_url
             )
           ) FILTER (WHERE o.ott_id IS NOT NULL),
           '[]'

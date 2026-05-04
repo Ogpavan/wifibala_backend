@@ -5,7 +5,12 @@ import deletePlan from "../controllers/Plans/deletePlans.js";
 import getPlans from "../controllers/Plans/getPlans.js";
 import { getPlanById } from "../controllers/Plans/planDetails.js";
 import getOperators from "../controllers/Plans/operator.js";
-import getOTTPlatforms from "../controllers/Plans/ott.js";
+import upload from "../middlewares/upload.js";
+import getOTTPlatforms, {
+  createOTTPlatform,
+  deleteOTTPlatform,
+  updateOTTPlatform,
+} from "../controllers/Plans/ott.js";
 import {
   createSubscription,
   getAllSubscriptions,
@@ -17,6 +22,9 @@ const router = Router();
 // ✅ SPECIFIC ROUTES FIRST - MUST come before /:id
 router.get("/operators", getOperators);
 router.get("/ott-platforms", getOTTPlatforms);
+router.post("/ott-platforms", upload.single("logo"), createOTTPlatform);
+router.put("/ott-platforms/:id", upload.single("logo"), updateOTTPlatform);
+router.delete("/ott-platforms/:id", deleteOTTPlatform);
 router.get("/subscription/all", getAllSubscriptions);
 
 // POST routes
