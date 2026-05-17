@@ -1,3 +1,54 @@
+import pool from "../../config/db.js";
+
+// Get the latest subscription for a single user
+export const getLatestSubscriptionForUser = async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    if (!user_id) {
+      return res.status(400).json({ message: "Missing user_id" });
+    }
+
+    const query = `
+      SELECT
+        us.subscription_id,
+        us.user_id,
+        us.plan_id,
+        us.price_paid,
+        us.end_date,
+        us.auto_renew,
+        us.created_at,
+        us.updated_at,
+        p.description AS plan_description,
+        p.price AS plan_price,
+        p.validity,
+        p.speed,
+        p.data_limit,
+        o.id AS operator_id,
+        o.name AS operator_name,
+        o.logo_url
+      FROM user_subscriptions us
+      JOIN plans p ON us.plan_id = p.plan_id
+      LEFT JOIN operators o ON p.operator_id = o.id
+      WHERE us.user_id = $1
+      ORDER BY us.created_at DESC, us.subscription_id DESC
+      LIMIT 1;
+    `;
+
+    const { rows } = await pool.query(query, [user_id]);
+
+    return res.status(200).json({
+      success: true,
+      message: "Latest subscription fetched successfully",
+      subscription: rows[0] || null,
+    });
+  } catch (error) {
+    console.error("Get latest subscription error:", error);
+    return res
+      .status(500)
+      .json({ message: "Internal server error", error: error.message });
+  }
+};
+
 // Delete a user subscription
 export const deleteSubscription = async (req, res) => {
   try {
@@ -21,7 +72,6 @@ export const deleteSubscription = async (req, res) => {
       .json({ message: "Internal server error", error: error.message });
   }
 };
-import pool from "../../config/db.js";
 // Get all subscribed user details
 export const getAllSubscriptions = async (req, res) => {
   try {

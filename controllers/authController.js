@@ -1,6 +1,66 @@
+/* global process */
 import pool from "../config/db.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import {
+  applyReferralReward,
+  ensureUserReferralCode,
+  findUserByReferralCode,
+  generateUniqueReferralCode,
+} from "../utils/referral.js";
+
+function makeDeletedPhoneValue(userId) {
+  const idPart = Number(userId).toString(36).toUpperCase();
+  const timePart = (Date.now() % 2176782336).toString(36).toUpperCase().slice(-6);
+  return `D${idPart}${timePart}`.slice(0, 15);
+}
+
+function makeDeletedEmailValue(userId) {
+  return `d${Number(userId).toString(36).toLowerCase()}@d.l`.slice(0, 15);
+}
+
+async function ensureUserIdentityArchiveSchema(client = pool) {
+  await client.query(
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_phone_number VARCHAR(50)",
+  );
+  await client.query(
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_email VARCHAR(255)",
+  );
+  await client.query(
+    `UPDATE users
+     SET deleted_phone_number = COALESCE(deleted_phone_number, phone_number),
+         deleted_email = COALESCE(deleted_email, email),
+         phone_number = CASE
+           WHEN isdeleted = true THEN CONCAT('D', LPAD(user_id::text, 8, '0'))
+           ELSE phone_number
+         END,
+         email = CASE
+           WHEN isdeleted = true THEN CONCAT('d', user_id::text, '@d.l')
+           ELSE email
+         END,
+         updated_at = NOW()
+     WHERE isdeleted = true
+       AND (deleted_phone_number IS NULL OR deleted_email IS NULL OR phone_number IS NULL OR email IS NULL OR phone_number NOT LIKE 'deleted_%' OR email NOT LIKE 'deleted_%')`,
+  );
+}
+
+async function findDeletedUserByIdentity(client, mobile, email) {
+  const result = await client.query(
+    `SELECT user_id
+     FROM users
+     WHERE isdeleted = true
+       AND (
+         deleted_phone_number = $1
+         OR deleted_email = $2
+         OR phone_number = $1
+         OR email = $2
+       )
+     ORDER BY updated_at DESC NULLS LAST, created_at DESC
+     LIMIT 1`,
+    [mobile, email],
+  );
+  return result.rows[0] || null;
+}
 
 /* =======================
    DELETE USER (SOFT)
@@ -9,14 +69,17 @@ export const deleteUser = async (req, res) => {
   const { id } = req.params;
 
   try {
+    await ensureUserIdentityArchiveSchema(pool);
     const result = await pool.query(
       `UPDATE users
        SET isdeleted = true,
-           phone_number = CONCAT('deleted_', user_id, '_', EXTRACT(EPOCH FROM NOW())::bigint),
-           email = CONCAT('deleted_', user_id, '_', EXTRACT(EPOCH FROM NOW())::bigint, '@deleted.local'),
+           deleted_phone_number = phone_number,
+           deleted_email = email,
+           phone_number = $2,
+           email = $3,
            updated_at = NOW()
        WHERE user_id = $1`,
-      [id],
+      [id, makeDeletedPhoneValue(id), makeDeletedEmailValue(id)],
     );
 
     if (result.rowCount === 0) {
@@ -43,7 +106,7 @@ export const deleteUser = async (req, res) => {
    SIGNUP
 ======================= */
 export const signup = async (req, res) => {
-  const { name, mobile, email, address, password } = req.body;
+  const { name, mobile, email, address, password, referral_code } = req.body;
 
   if (!name || !mobile || !email || !address || !password) {
     return res.status(400).json({
@@ -52,11 +115,28 @@ export const signup = async (req, res) => {
     });
   }
 
+  const normalizedReferralCode = referral_code?.trim()
+    ? referral_code.trim().toUpperCase()
+    : null;
+
+  if (normalizedReferralCode && !/^[A-Z0-9]{6}$/.test(normalizedReferralCode)) {
+    return res.status(400).json({
+      success: false,
+      message: "Referral code must be 6 alphanumeric characters",
+    });
+  }
+
+  let client;
+
   try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    await ensureUserIdentityArchiveSchema(client);
+
     const normalizedMobile = mobile.trim();
     const normalizedEmail = email.trim();
 
-    const activeExisting = await pool.query(
+    const activeExisting = await client.query(
       `SELECT user_id
        FROM users
        WHERE isdeleted = false
@@ -74,36 +154,43 @@ export const signup = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const deletedMatch = await pool.query(
-      `SELECT user_id
-       FROM users
-       WHERE isdeleted = true
-         AND (phone_number = $1 OR email = $2)
-       ORDER BY updated_at DESC NULLS LAST, created_at DESC
-       LIMIT 1`,
-      [normalizedMobile, normalizedEmail],
+    const deletedMatch = await findDeletedUserByIdentity(
+      client,
+      normalizedMobile,
+      normalizedEmail,
     );
 
-    if (deletedMatch.rows.length > 0) {
-      await pool.query(
+    if (deletedMatch) {
+      const restoredCode = await ensureUserReferralCode(
+        deletedMatch.user_id,
+        client,
+      );
+
+      await client.query(
         `UPDATE users
          SET name = $1,
              phone_number = $2,
              email = $3,
              password_hash = $4,
              address = $5,
+             referral_code = COALESCE(referral_code, $6),
+             deleted_phone_number = NULL,
+             deleted_email = NULL,
              isdeleted = false,
              updated_at = NOW()
-         WHERE user_id = $6`,
+         WHERE user_id = $7`,
         [
           name,
           normalizedMobile,
           normalizedEmail,
           hashedPassword,
           address,
-          deletedMatch.rows[0].user_id,
+          restoredCode,
+          deletedMatch.user_id,
         ],
       );
+
+      await client.query("COMMIT");
 
       return res.status(200).json({
         success: true,
@@ -111,23 +198,62 @@ export const signup = async (req, res) => {
       });
     }
 
-    await pool.query(
+    const newReferralCode = await generateUniqueReferralCode(client);
+
+    const created = await client.query(
       `INSERT INTO users 
-       (name, phone_number, email, password_hash, address, wallet, created_at, updated_at, isdeleted)
-       VALUES ($1, $2, $3, $4, $5, 0, NOW(), NOW(), false)`,
-      [name, normalizedMobile, normalizedEmail, hashedPassword, address],
+       (name, phone_number, email, password_hash, address, wallet, referral_code, referred_by_user_id, created_at, updated_at, isdeleted)
+       VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, NOW(), NOW(), false)
+       RETURNING user_id, referral_code`,
+      [name, normalizedMobile, normalizedEmail, hashedPassword, address, newReferralCode],
     );
+
+    if (normalizedReferralCode) {
+      const referrer = await findUserByReferralCode(normalizedReferralCode, client);
+      if (!referrer) {
+        throw new Error("Invalid referral code");
+      }
+
+      await client.query(
+        `UPDATE users
+         SET referred_by_user_id = $1,
+             updated_at = NOW()
+         WHERE user_id = $2`,
+        [referrer.user_id, created.rows[0].user_id],
+      );
+
+      const referralResult = await applyReferralReward({
+        referredUserId: created.rows[0].user_id,
+        referralCode: normalizedReferralCode,
+        client,
+      });
+
+      if (!referralResult.applied && referralResult.reason === "invalid_code") {
+        throw new Error("Invalid referral code");
+      }
+    }
+
+    await client.query("COMMIT");
 
     res.status(201).json({
       success: true,
       message: "Signup successful",
+      referral_code: created.rows[0].referral_code,
     });
   } catch (err) {
-    res.status(500).json({
+    if (client) {
+      await client.query("ROLLBACK");
+    }
+    const isReferralError = err.message === "Invalid referral code";
+    res.status(isReferralError ? 400 : 500).json({
       success: false,
-      message: "Server error",
+      message: isReferralError ? err.message : "Server error",
       error: err.message,
     });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 };
 
@@ -147,6 +273,7 @@ export const createUserByAdmin = async (req, res) => {
   try {
     const normalizedMobile = mobile.trim();
     const normalizedEmail = email?.trim() ? email.trim() : null;
+    await ensureUserIdentityArchiveSchema(pool);
 
     const activeExisting = normalizedEmail
       ? await pool.query(
@@ -175,27 +302,13 @@ export const createUserByAdmin = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const deletedMatch = normalizedEmail
-      ? await pool.query(
-          `SELECT user_id
-           FROM users
-           WHERE isdeleted = true
-             AND (phone_number = $1 OR email = $2)
-           ORDER BY updated_at DESC NULLS LAST, created_at DESC
-           LIMIT 1`,
-          [normalizedMobile, normalizedEmail],
-        )
-      : await pool.query(
-          `SELECT user_id
-           FROM users
-           WHERE isdeleted = true
-             AND phone_number = $1
-           ORDER BY updated_at DESC NULLS LAST, created_at DESC
-           LIMIT 1`,
-          [normalizedMobile],
-        );
+    const deletedMatch = await findDeletedUserByIdentity(
+      pool,
+      normalizedMobile,
+      normalizedEmail,
+    );
 
-    if (deletedMatch.rows.length > 0) {
+    if (deletedMatch) {
       const result = await pool.query(
         `UPDATE users
          SET name = $1,
@@ -203,6 +316,8 @@ export const createUserByAdmin = async (req, res) => {
              email = $3,
              password_hash = $4,
              address = $5,
+             deleted_phone_number = NULL,
+             deleted_email = NULL,
              isdeleted = false,
              updated_at = NOW()
          WHERE user_id = $6
@@ -213,14 +328,19 @@ export const createUserByAdmin = async (req, res) => {
           normalizedEmail,
           hashedPassword,
           address,
-          deletedMatch.rows[0].user_id,
+          deletedMatch.user_id,
         ],
       );
+
+      const referralCode = await ensureUserReferralCode(result.rows[0].user_id);
 
       return res.status(200).json({
         success: true,
         message: "User created successfully",
-        user: result.rows[0],
+        user: {
+          ...result.rows[0],
+          referral_code: referralCode,
+        },
       });
     }
 
@@ -232,10 +352,15 @@ export const createUserByAdmin = async (req, res) => {
       [name, normalizedMobile, normalizedEmail, hashedPassword, address],
     );
 
+    const referralCode = await ensureUserReferralCode(created.rows[0].user_id);
+
     return res.status(201).json({
       success: true,
       message: "User created successfully",
-      user: created.rows[0],
+      user: {
+        ...created.rows[0],
+        referral_code: referralCode,
+      },
     });
   } catch (err) {
     return res.status(500).json({
@@ -397,6 +522,8 @@ export const signin = async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || "7d" },
     );
 
+    const referralCode = await ensureUserReferralCode(user.user_id);
+
     res.json({
       success: true,
       message: "Signin successful",
@@ -408,6 +535,7 @@ export const signin = async (req, res) => {
         email: user.email,
         address: user.address,
         wallet: user.wallet || 0,
+        referral_code: referralCode,
       },
     });
   } catch (err) {

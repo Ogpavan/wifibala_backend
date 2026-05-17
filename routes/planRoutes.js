@@ -15,6 +15,7 @@ import {
   createSubscription,
   getAllSubscriptions,
   deleteSubscription,
+  getLatestSubscriptionForUser,
 } from "../controllers/Plans/subcription.js";
 
 const router = Router();
@@ -26,6 +27,7 @@ router.post("/ott-platforms", upload.single("logo"), createOTTPlatform);
 router.put("/ott-platforms/:id", upload.single("logo"), updateOTTPlatform);
 router.delete("/ott-platforms/:id", deleteOTTPlatform);
 router.get("/subscription/all", getAllSubscriptions);
+router.get("/subscription/latest/:user_id", getLatestSubscriptionForUser);
 
 // POST routes
 router.post("/create", createPlan);

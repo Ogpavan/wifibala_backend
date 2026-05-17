@@ -8,6 +8,10 @@ import planRoutes from "./routes/planRoutes.js";
 import offerRoutes from "./routes/offerRoutes.js";
 import complaintRoutes from "./routes/complaintRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
+import portChangeRoutes from "./routes/portChangeRoutes.js";
+import { ensurePortChangeRequestsSchema } from "./controllers/portChangeController.js";
+import referralRoutes from "./routes/referralRoutes.js";
+import { ensureReferralSchema } from "./controllers/referralController.js";
 
 import carouselRoute from "./routes/carouselRoute.js";
 import vipPlanRoutes from "./routes/vipRoutes.js";
@@ -40,6 +44,8 @@ app.use("/api/plans", planRoutes);
 app.use("/api/offers", offerRoutes);
 app.use("/api/carousel", carouselRoute);
 app.use("/api/complaints", complaintRoutes);
+app.use("/api/port-change-requests", portChangeRoutes);
+app.use("/api/referrals", referralRoutes);
 app.use("/api/settings", settingsRoutes);
 
 // 🔹 urlencoded ONLY where needed (auth forms etc.)
@@ -59,6 +65,10 @@ app.get("/", (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
+
+await ensurePortChangeRequestsSchema();
+await ensureReferralSchema();
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
