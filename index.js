@@ -8,6 +8,7 @@ import planRoutes from "./routes/planRoutes.js";
 import offerRoutes from "./routes/offerRoutes.js";
 import complaintRoutes from "./routes/complaintRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
+import { ensureMobileOtpSchema } from "./controllers/authController.js";
 import portChangeRoutes from "./routes/portChangeRoutes.js";
 import { ensurePortChangeRequestsSchema } from "./controllers/portChangeController.js";
 import referralRoutes from "./routes/referralRoutes.js";
@@ -68,6 +69,7 @@ const PORT = process.env.PORT || 5000;
 
 await ensurePortChangeRequestsSchema();
 await ensureReferralSchema();
+await ensureMobileOtpSchema();
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);

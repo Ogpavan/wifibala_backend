@@ -2,12 +2,17 @@ import pool from "../config/db.js";
 
 // Submit a new complaint
 export const submitComplaint = async (req, res) => {
-  const { user_id, subject, description, category, priority } = req.body;
+  const { user_id, subject, description, message, category, priority } = req.body;
+  const complaintMessage = String(description || message || "").trim();
+  const complaintSubject =
+    String(subject || "").trim() ||
+    complaintMessage.slice(0, 80) ||
+    "Complaint";
 
-  if (!user_id || !subject || !description) {
+  if (!user_id || !complaintMessage) {
     return res.status(400).json({
       success: false,
-      message: "User ID, subject and description are required",
+      message: "User ID and message are required",
     });
   }
 
@@ -17,8 +22,8 @@ export const submitComplaint = async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, NOW(), NOW()) RETURNING *`,
       [
         user_id,
-        subject,
-        description,
+        complaintSubject,
+        complaintMessage,
         category || "general",
         priority || "medium",
       ],

@@ -5,6 +5,10 @@ let portRequestKeyColumnPromise = null;
 
 export const ensurePortChangeRequestsSchema = async () => {
   await pool.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS current_operator_id INTEGER DEFAULT NULL
+  `);
+  await pool.query(`
     ALTER TABLE port_change_requests
       ADD COLUMN IF NOT EXISTS user_id INTEGER DEFAULT NULL REFERENCES users(user_id) ON DELETE SET NULL,
       ADD COLUMN IF NOT EXISTS current_operator_id INTEGER NOT NULL DEFAULT 0,
@@ -95,7 +99,7 @@ async function getLatestPortChangeRequestByUser(userId) {
 }
 
 async function getCurrentPortProviderByUser(userId) {
-  const result = await pool.query(
+  const latestPortResult = await pool.query(
     `SELECT COALESCE(requested_op.name, 'Airtel') AS current_port_provider
      FROM port_change_requests pcr
      LEFT JOIN operators requested_op ON requested_op.id = pcr.requested_operator_id
@@ -106,7 +110,20 @@ async function getCurrentPortProviderByUser(userId) {
     [userId],
   );
 
-  return result.rows[0]?.current_port_provider || "Airtel";
+  if (latestPortResult.rows[0]?.current_port_provider) {
+    return latestPortResult.rows[0].current_port_provider;
+  }
+
+  const signupProviderResult = await pool.query(
+    `SELECT COALESCE(op.name, 'Airtel') AS current_port_provider
+     FROM users u
+     LEFT JOIN operators op ON op.id = u.current_operator_id
+     WHERE u.user_id = $1::int
+     LIMIT 1`,
+    [userId],
+  );
+
+  return signupProviderResult.rows[0]?.current_port_provider || "Airtel";
 }
 
 function normalizeStatus(status) {

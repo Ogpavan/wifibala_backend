@@ -1,6 +1,10 @@
 import express from "express";
 import {
   signup,
+  sendOtp,
+  verifyOtp,
+  sendForgotPasswordOtp,
+  resetForgotPassword,
   createUserByAdmin,
   updateUserByAdmin,
   signin,
@@ -12,6 +16,10 @@ import {
 
 const router = express.Router();
 
+router.post("/send-otp", sendOtp);
+router.post("/verify-otp", verifyOtp);
+router.post("/forgot-password/send-otp", sendForgotPasswordOtp);
+router.post("/forgot-password/reset", resetForgotPassword);
 router.post("/signup", signup);
 router.post("/signin", signin);
 router.post("/admin/users", createUserByAdmin);

@@ -2,12 +2,132 @@
 import pool from "../config/db.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import https from "https";
+import { randomInt } from "crypto";
 import {
   applyReferralReward,
   ensureUserReferralCode,
   findUserByReferralCode,
   generateUniqueReferralCode,
 } from "../utils/referral.js";
+
+const OTP_EXPIRY_MINUTES = 5;
+const OTP_VERIFIED_MINUTES = 15;
+const OTP_MAX_ATTEMPTS = 5;
+
+function normalizeIndianMobile(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.length === 10) return digits;
+  if (digits.length === 12 && digits.startsWith("91")) return digits.slice(2);
+  return null;
+}
+
+function buildOtpProviderMobile(mobile) {
+  return `91${mobile}`;
+}
+
+function requestText(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        body += chunk;
+      });
+      response.on("end", () => {
+        resolve({
+          ok: response.statusCode >= 200 && response.statusCode < 300,
+          status: response.statusCode,
+          body,
+        });
+      });
+    });
+
+    req.setTimeout(10000, () => {
+      req.destroy(new Error("OTP provider request timed out"));
+    });
+
+    req.on("error", reject);
+  });
+}
+
+export async function ensureMobileOtpSchema(client = pool) {
+  await client.query(
+    `CREATE TABLE IF NOT EXISTS mobile_otp_verifications (
+       mobile VARCHAR(15) PRIMARY KEY,
+       otp_hash VARCHAR(255) NOT NULL,
+       expires_at TIMESTAMPTZ NOT NULL,
+       attempts INTEGER NOT NULL DEFAULT 0,
+       verified_until TIMESTAMPTZ,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+  );
+}
+
+async function isMobileOtpVerified(mobile) {
+  await ensureMobileOtpSchema(pool);
+  const result = await pool.query(
+    `SELECT 1
+     FROM mobile_otp_verifications
+     WHERE mobile = $1
+       AND verified_until > NOW()
+     LIMIT 1`,
+    [mobile],
+  );
+  return result.rows.length > 0;
+}
+
+async function consumeMobileOtpVerification(client, mobile) {
+  await client.query(
+    `UPDATE mobile_otp_verifications
+     SET verified_until = NULL,
+         expires_at = NOW(),
+         updated_at = NOW()
+     WHERE mobile = $1`,
+    [mobile],
+  );
+}
+
+async function sendMobileOtp(normalizedMobile) {
+  const authKey = process.env.APITXT_AUTH_KEY;
+  if (!authKey) {
+    const error = new Error("Server configuration error - OTP auth key missing");
+    error.status = 500;
+    throw error;
+  }
+
+  await ensureMobileOtpSchema(pool);
+
+  const otp = String(randomInt(1000, 10000));
+  const otpHash = await bcrypt.hash(otp, 10);
+  const otpUrl = new URL(
+    process.env.APITXT_SEND_OTP_URL || "https://apitxt.com/api/sendOTP",
+  );
+  otpUrl.searchParams.set("authkey", authKey);
+  otpUrl.searchParams.set("mobile", buildOtpProviderMobile(normalizedMobile));
+  otpUrl.searchParams.set("otp", otp);
+
+  const providerResponse = await requestText(otpUrl);
+  if (!providerResponse.ok) {
+    const error = new Error("Failed to send OTP");
+    error.status = 502;
+    throw error;
+  }
+
+  await pool.query(
+    `INSERT INTO mobile_otp_verifications
+     (mobile, otp_hash, expires_at, attempts, verified_until, created_at, updated_at)
+     VALUES ($1, $2, NOW() + ($3::int * INTERVAL '1 minute'), 0, NULL, NOW(), NOW())
+     ON CONFLICT (mobile)
+     DO UPDATE SET otp_hash = EXCLUDED.otp_hash,
+                   expires_at = EXCLUDED.expires_at,
+                   attempts = 0,
+                   verified_until = NULL,
+                   updated_at = NOW()`,
+    [normalizedMobile, otpHash, OTP_EXPIRY_MINUTES],
+  );
+}
 
 function makeDeletedPhoneValue(userId) {
   const idPart = Number(userId).toString(36).toUpperCase();
@@ -25,6 +145,9 @@ async function ensureUserIdentityArchiveSchema(client = pool) {
   );
   await client.query(
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_email VARCHAR(255)",
+  );
+  await client.query(
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_operator_id INTEGER DEFAULT NULL",
   );
   await client.query(
     `UPDATE users
@@ -60,6 +183,31 @@ async function findDeletedUserByIdentity(client, mobile, email) {
     [mobile, email],
   );
   return result.rows[0] || null;
+}
+
+async function resolveUserOperatorId(value, client = pool) {
+  if (!value) return null;
+
+  const normalized = String(value).trim();
+  const numericId = Number(normalized);
+
+  if (!Number.isNaN(numericId) && numericId > 0) {
+    const byId = await client.query(
+      "SELECT id FROM operators WHERE id = $1::int AND active = true LIMIT 1",
+      [numericId],
+    );
+    if (byId.rows.length) return byId.rows[0].id;
+  }
+
+  const byName = await client.query(
+    `SELECT id
+     FROM operators
+     WHERE active = true
+       AND (LOWER(name) = LOWER($1::text) OR LOWER(code) = LOWER($1::text))
+     LIMIT 1`,
+    [normalized],
+  );
+  return byName.rows[0]?.id || null;
 }
 
 /* =======================
@@ -103,15 +251,252 @@ export const deleteUser = async (req, res) => {
 };
 
 /* =======================
+   MOBILE OTP
+======================= */
+export const sendOtp = async (req, res) => {
+  const normalizedMobile = normalizeIndianMobile(req.body?.mobile);
+
+  if (!normalizedMobile) {
+    return res.status(400).json({
+      success: false,
+      message: "Valid 10-digit mobile number is required",
+    });
+  }
+
+  try {
+    const activeExisting = await pool.query(
+      `SELECT user_id
+       FROM users
+       WHERE isdeleted = false
+         AND phone_number = $1
+       LIMIT 1`,
+      [normalizedMobile],
+    );
+
+    if (activeExisting.rows.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: "MOBILE_ALREADY_REGISTERED",
+        message: "Number already registered. Please continue with Sign In.",
+      });
+    }
+
+    await sendMobileOtp(normalizedMobile);
+
+    return res.json({
+      success: true,
+      message: "OTP sent successfully",
+      expires_in_minutes: OTP_EXPIRY_MINUTES,
+    });
+  } catch (err) {
+    return res.status(err.status || 500).json({
+      success: false,
+      message: err.status ? err.message : "Server error",
+      error: err.message,
+    });
+  }
+};
+
+export const sendForgotPasswordOtp = async (req, res) => {
+  const normalizedMobile = normalizeIndianMobile(req.body?.mobile);
+
+  if (!normalizedMobile) {
+    return res.status(400).json({
+      success: false,
+      message: "Valid 10-digit mobile number is required",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT user_id
+       FROM users
+       WHERE isdeleted = false
+         AND phone_number = $1
+       LIMIT 1`,
+      [normalizedMobile],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        code: "MOBILE_NOT_REGISTERED",
+        message: "Number not registered. Please create an account.",
+      });
+    }
+
+    await sendMobileOtp(normalizedMobile);
+
+    return res.json({
+      success: true,
+      message: "OTP sent successfully",
+      expires_in_minutes: OTP_EXPIRY_MINUTES,
+    });
+  } catch (err) {
+    return res.status(err.status || 500).json({
+      success: false,
+      message: err.status ? err.message : "Server error",
+      error: err.message,
+    });
+  }
+};
+
+export const resetForgotPassword = async (req, res) => {
+  const normalizedMobile = normalizeIndianMobile(req.body?.mobile);
+  const password = String(req.body?.password || "");
+
+  if (!normalizedMobile) {
+    return res.status(400).json({
+      success: false,
+      message: "Valid 10-digit mobile number is required",
+    });
+  }
+
+  if (password.length < 6) {
+    return res.status(400).json({
+      success: false,
+      message: "Password must be at least 6 characters long",
+    });
+  }
+
+  try {
+    const mobileVerified = await isMobileOtpVerified(normalizedMobile);
+    if (!mobileVerified) {
+      return res.status(403).json({
+        success: false,
+        message: "Please verify OTP before resetting password",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      `UPDATE users
+       SET password_hash = $1,
+           updated_at = NOW()
+       WHERE phone_number = $2
+         AND isdeleted = false
+       RETURNING user_id`,
+      [hashedPassword, normalizedMobile],
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    await consumeMobileOtpVerification(pool, normalizedMobile);
+
+    return res.json({
+      success: true,
+      message: "Password reset successful. Please sign in.",
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: err.message,
+    });
+  }
+};
+
+export const verifyOtp = async (req, res) => {
+  const normalizedMobile = normalizeIndianMobile(req.body?.mobile);
+  const otp = String(req.body?.otp || "").replace(/\D/g, "");
+
+  if (!normalizedMobile || !/^\d{4}$/.test(otp)) {
+    return res.status(400).json({
+      success: false,
+      message: "Valid mobile number and 4-digit OTP are required",
+    });
+  }
+
+  try {
+    await ensureMobileOtpSchema(pool);
+
+    const result = await pool.query(
+      `SELECT mobile, otp_hash, expires_at, attempts
+       FROM mobile_otp_verifications
+       WHERE mobile = $1
+       LIMIT 1`,
+      [normalizedMobile],
+    );
+
+    const record = result.rows[0];
+    if (!record || new Date(record.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({
+        success: false,
+        message: "OTP expired. Please request a new OTP",
+      });
+    }
+
+    if (record.attempts >= OTP_MAX_ATTEMPTS) {
+      return res.status(429).json({
+        success: false,
+        message: "Too many invalid OTP attempts. Please request a new OTP",
+      });
+    }
+
+    const isMatch = await bcrypt.compare(otp, record.otp_hash);
+    if (!isMatch) {
+      await pool.query(
+        `UPDATE mobile_otp_verifications
+         SET attempts = attempts + 1,
+             updated_at = NOW()
+         WHERE mobile = $1`,
+        [normalizedMobile],
+      );
+
+      return res.status(400).json({
+        success: false,
+        message: "Invalid OTP",
+      });
+    }
+
+    await pool.query(
+      `UPDATE mobile_otp_verifications
+       SET attempts = 0,
+           verified_until = NOW() + ($2::int * INTERVAL '1 minute'),
+           updated_at = NOW()
+       WHERE mobile = $1`,
+      [normalizedMobile, OTP_VERIFIED_MINUTES],
+    );
+
+    return res.json({
+      success: true,
+      message: "Mobile number verified successfully",
+      verified_for_minutes: OTP_VERIFIED_MINUTES,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: err.message,
+    });
+  }
+};
+
+/* =======================
    SIGNUP
 ======================= */
 export const signup = async (req, res) => {
-  const { name, mobile, email, address, password, referral_code } = req.body;
+  const {
+    name,
+    mobile,
+    email,
+    address,
+    password,
+    referral_code,
+    current_operator_id,
+    current_provider,
+    current_company,
+  } = req.body;
 
-  if (!name || !mobile || !email || !address || !password) {
+  if (!name || !mobile || !address || !password) {
     return res.status(400).json({
       success: false,
-      message: "All fields are required",
+      message: "Name, mobile, address and password are required",
     });
   }
 
@@ -129,23 +514,60 @@ export const signup = async (req, res) => {
   let client;
 
   try {
+    const normalizedMobile = normalizeIndianMobile(mobile);
+    if (!normalizedMobile) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid 10-digit mobile number is required",
+      });
+    }
+
+    const normalizedEmail = email?.trim() ? email.trim() : null;
+    const mobileVerified = await isMobileOtpVerified(normalizedMobile);
+    if (!mobileVerified) {
+      return res.status(403).json({
+        success: false,
+        message: "Please verify mobile number before signup",
+      });
+    }
+
     client = await pool.connect();
     await client.query("BEGIN");
     await ensureUserIdentityArchiveSchema(client);
 
-    const normalizedMobile = mobile.trim();
-    const normalizedEmail = email.trim();
-
-    const activeExisting = await client.query(
-      `SELECT user_id
-       FROM users
-       WHERE isdeleted = false
-         AND (phone_number = $1 OR email = $2)
-       LIMIT 1`,
-      [normalizedMobile, normalizedEmail],
+    const currentOperatorId = await resolveUserOperatorId(
+      current_operator_id || current_provider || current_company,
+      client,
     );
 
+    if (!currentOperatorId) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        message: "Please select your current WiFi port",
+      });
+    }
+
+    const activeExisting = normalizedEmail
+      ? await client.query(
+          `SELECT user_id
+           FROM users
+           WHERE isdeleted = false
+             AND (phone_number = $1 OR email = $2)
+           LIMIT 1`,
+          [normalizedMobile, normalizedEmail],
+        )
+      : await client.query(
+          `SELECT user_id
+           FROM users
+           WHERE isdeleted = false
+             AND phone_number = $1
+           LIMIT 1`,
+          [normalizedMobile],
+        );
+
     if (activeExisting.rows.length > 0) {
+      await client.query("ROLLBACK");
       return res.status(409).json({
         success: false,
         message: "User already exists",
@@ -173,23 +595,26 @@ export const signup = async (req, res) => {
              email = $3,
              password_hash = $4,
              address = $5,
-             referral_code = COALESCE(referral_code, $6),
+             current_operator_id = $6,
+             referral_code = COALESCE(referral_code, $7),
              deleted_phone_number = NULL,
              deleted_email = NULL,
              isdeleted = false,
              updated_at = NOW()
-         WHERE user_id = $7`,
+         WHERE user_id = $8`,
         [
           name,
           normalizedMobile,
           normalizedEmail,
           hashedPassword,
           address,
+          currentOperatorId,
           restoredCode,
           deletedMatch.user_id,
         ],
       );
 
+      await consumeMobileOtpVerification(client, normalizedMobile);
       await client.query("COMMIT");
 
       return res.status(200).json({
@@ -202,10 +627,18 @@ export const signup = async (req, res) => {
 
     const created = await client.query(
       `INSERT INTO users 
-       (name, phone_number, email, password_hash, address, wallet, referral_code, referred_by_user_id, created_at, updated_at, isdeleted)
-       VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, NOW(), NOW(), false)
+       (name, phone_number, email, password_hash, address, wallet, referral_code, referred_by_user_id, current_operator_id, created_at, updated_at, isdeleted)
+       VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, $7, NOW(), NOW(), false)
        RETURNING user_id, referral_code`,
-      [name, normalizedMobile, normalizedEmail, hashedPassword, address, newReferralCode],
+      [
+        name,
+        normalizedMobile,
+        normalizedEmail,
+        hashedPassword,
+        address,
+        newReferralCode,
+        currentOperatorId,
+      ],
     );
 
     if (normalizedReferralCode) {
@@ -233,6 +666,7 @@ export const signup = async (req, res) => {
       }
     }
 
+    await consumeMobileOtpVerification(client, normalizedMobile);
     await client.query("COMMIT");
 
     res.status(201).json({
@@ -271,7 +705,14 @@ export const createUserByAdmin = async (req, res) => {
   }
 
   try {
-    const normalizedMobile = mobile.trim();
+    const normalizedMobile = normalizeIndianMobile(mobile);
+    if (!normalizedMobile) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid 10-digit mobile number is required",
+      });
+    }
+
     const normalizedEmail = email?.trim() ? email.trim() : null;
     await ensureUserIdentityArchiveSchema(pool);
 
@@ -393,6 +834,14 @@ export const updateUserByAdmin = async (req, res) => {
   }
 
   try {
+    const normalizedMobile = normalizeIndianMobile(mobile);
+    if (!normalizedMobile) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid 10-digit mobile number is required",
+      });
+    }
+
     const normalizedEmail = email?.trim() ? email.trim() : null;
 
     const duplicate = normalizedEmail
@@ -403,7 +852,7 @@ export const updateUserByAdmin = async (req, res) => {
              AND user_id <> $1
              AND (phone_number = $2 OR email = $3)
            LIMIT 1`,
-          [id, mobile, normalizedEmail],
+          [id, normalizedMobile, normalizedEmail],
         )
       : await pool.query(
           `SELECT user_id
@@ -412,7 +861,7 @@ export const updateUserByAdmin = async (req, res) => {
              AND user_id <> $1
              AND phone_number = $2
            LIMIT 1`,
-          [id, mobile],
+          [id, normalizedMobile],
         );
 
     if (duplicate.rows.length > 0) {
@@ -436,7 +885,7 @@ export const updateUserByAdmin = async (req, res) => {
            updated_at = NOW()
        WHERE user_id = $6 AND isdeleted = false
        RETURNING user_id, name, phone_number, email, address, COALESCE(wallet, 0) AS wallet, created_at`,
-      [name, mobile, normalizedEmail, address, passwordToSet, id],
+      [name, normalizedMobile, normalizedEmail, address, passwordToSet, id],
     );
 
     if (result.rowCount === 0) {
@@ -474,6 +923,14 @@ export const signin = async (req, res) => {
   }
 
   try {
+    const normalizedMobile = normalizeIndianMobile(mobile);
+    if (!normalizedMobile) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid 10-digit mobile number is required",
+      });
+    }
+
     // ✅ Validate JWT_SECRET exists
     if (!process.env.JWT_SECRET) {
       console.error("JWT_SECRET is not defined in environment variables");
@@ -483,9 +940,14 @@ export const signin = async (req, res) => {
       });
     }
 
+    await ensureUserIdentityArchiveSchema(pool);
+
     const result = await pool.query(
-      "SELECT * FROM users WHERE phone_number = $1",
-      [mobile],
+      `SELECT u.*, op.name AS current_operator_name
+       FROM users u
+       LEFT JOIN operators op ON op.id = u.current_operator_id
+       WHERE u.phone_number = $1`,
+      [normalizedMobile],
     );
 
     if (result.rows.length === 0) {
@@ -535,6 +997,8 @@ export const signin = async (req, res) => {
         email: user.email,
         address: user.address,
         wallet: user.wallet || 0,
+        current_operator_id: user.current_operator_id,
+        current_provider: user.current_operator_name || null,
         referral_code: referralCode,
       },
     });
@@ -553,6 +1017,8 @@ export const signin = async (req, res) => {
 ======================= */
 export const getAllUsers = async (req, res) => {
   try {
+    await ensureUserIdentityArchiveSchema(pool);
+
     const page = Math.max(parseInt(req.query.page || "1", 10), 1);
     const limit = Math.min(
       Math.max(parseInt(req.query.limit || "10", 10), 1),
@@ -561,22 +1027,24 @@ export const getAllUsers = async (req, res) => {
     const offset = (page - 1) * limit;
     const search = (req.query.search || "").trim().toLowerCase();
 
-    let whereClause = "WHERE isdeleted = false";
+    let whereClause = "WHERE u.isdeleted = false";
     const values = [];
 
     if (search) {
       values.push(`%${search}%`);
       whereClause += ` AND (
-        LOWER(name) LIKE $${values.length}
-        OR phone_number LIKE $${values.length}
-        OR LOWER(email) LIKE $${values.length}
-        OR LOWER(address) LIKE $${values.length}
+        LOWER(u.name) LIKE $${values.length}
+        OR u.phone_number LIKE $${values.length}
+        OR LOWER(u.email) LIKE $${values.length}
+        OR LOWER(u.address) LIKE $${values.length}
+        OR LOWER(op.name) LIKE $${values.length}
       )`;
     }
 
     const countResult = await pool.query(
       `SELECT COUNT(*)::int AS total
-       FROM users
+       FROM users u
+       LEFT JOIN operators op ON op.id = u.current_operator_id
        ${whereClause}`,
       values,
     );
@@ -586,12 +1054,15 @@ export const getAllUsers = async (req, res) => {
     values.push(offset);
 
     const result = await pool.query(
-      `SELECT user_id, name, phone_number, email, address,
-              COALESCE(wallet, 0) AS wallet,
-              created_at
-       FROM users
+      `SELECT u.user_id, u.name, u.phone_number, u.email, u.address,
+              u.current_operator_id,
+              op.name AS current_provider,
+              COALESCE(u.wallet, 0) AS wallet,
+              u.created_at
+       FROM users u
+       LEFT JOIN operators op ON op.id = u.current_operator_id
        ${whereClause}
-       ORDER BY created_at DESC
+       ORDER BY u.created_at DESC
        LIMIT $${values.length - 1}
        OFFSET $${values.length}`,
       values,
