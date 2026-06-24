@@ -13,6 +13,8 @@ import portChangeRoutes from "./routes/portChangeRoutes.js";
 import { ensurePortChangeRequestsSchema } from "./controllers/portChangeController.js";
 import referralRoutes from "./routes/referralRoutes.js";
 import { ensureReferralSchema } from "./controllers/referralController.js";
+import nativeNotificationRoutes from "./routes/nativeNotificationRoutes.js";
+import { ensureNativeNotificationSchema } from "./controllers/nativeNotificationController.js";
 
 import carouselRoute from "./routes/carouselRoute.js";
 import vipPlanRoutes from "./routes/vipRoutes.js";
@@ -48,6 +50,7 @@ app.use("/api/complaints", complaintRoutes);
 app.use("/api/port-change-requests", portChangeRoutes);
 app.use("/api/referrals", referralRoutes);
 app.use("/api/settings", settingsRoutes);
+app.use("/api/native-notifications", nativeNotificationRoutes);
 
 // 🔹 urlencoded ONLY where needed (auth forms etc.)
 app.use("/api/auth", express.urlencoded({ extended: true }), authRoutes);
@@ -70,6 +73,7 @@ const PORT = process.env.PORT || 5000;
 await ensurePortChangeRequestsSchema();
 await ensureReferralSchema();
 await ensureMobileOtpSchema();
+await ensureNativeNotificationSchema();
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
